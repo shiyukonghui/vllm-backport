@@ -929,6 +929,14 @@ class IsHybrid(Protocol):
         """
         ...
 
+    @classmethod
+    def get_mamba_state_copy_funcs(
+        cls,
+        mamba_types: set["MambaAttentionBackendEnum"],
+    ) -> "MambaStateCopyFuncsByType":
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
+
 
 @overload
 def is_hybrid(model: object) -> TypeIs[IsHybrid]: ...
@@ -1089,6 +1097,20 @@ class SupportsMambaPrefixCaching(Protocol):
     """
 
     supports_mamba_prefix_caching: ClassVar[Literal[True]] = True
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple["MambaStateCopyFunc", ...]:
+        """Return copy functions for the model's Mamba states."""
+        ...
+
+    @classmethod
+    def get_mamba_state_copy_funcs(
+        cls,
+        mamba_types: set["MambaAttentionBackendEnum"],
+    ) -> "MambaStateCopyFuncsByType":
+        """Map legacy copy functions to each requested Mamba backend."""
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
 
 @overload
