@@ -8,7 +8,7 @@
 
 ## 实测性能（8x RTX 4090 48GB，SM89）
 
-验证环境：`deepseek-server`（172.18.12.5），8x NVIDIA RTX 4090 48GB（Ada / SM89），双路 Xeon Gold 6530，565 GiB 内存，CUDA 13.0，Python 3.12 venv，8 卡 TP8。
+验证环境：本地服务器，8x NVIDIA RTX 4090 48GB（Ada / SM89），双路 Xeon Gold 6530，565 GiB 内存，CUDA 13.0，Python 3.12 venv，8 卡 TP8。
 
 ### DeepSeek-V4-Flash-0731（生产服务，`deepseek-v4-flash-0731`）
 

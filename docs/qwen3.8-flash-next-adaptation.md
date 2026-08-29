@@ -18,7 +18,7 @@
 | --- | --- |
 | GPU | 8x NVIDIA RTX 4090 48GB（Ada / SM89） |
 | CPU / 内存 | 双路 Xeon Gold 6530，565 GiB RAM |
-| 服务器 | deepseek-server（172.18.12.5） |
+| 服务器 | 本地 8x RTX 4090 48GB 服务器 |
 | CUDA | 13.0（`/data/cuda-13.0`，JIT 用） |
 | Python | 3.12 venv `/data/models/vllm-qwen4exp-env`（从生产 vllm-backport-env 克隆后重建 editable 安装） |
 | 源码 | `/data/models/vllm-qwen4exp-src`（独立目录，editable） |
