@@ -4,6 +4,36 @@ A VLLM fork that focuses on running Deepseek V4 Flash 0731 on Ampere at this mom
 
 Currently achieving 3435 tps prefill and 948 tps decoding on 8xA6000 (TP4PP2)  and this should also work on A100.
 
+## Measured Performance (8x RTX 4090 48GB, SM89)
+
+Validated on `deepseek-server` (172.18.12.5): 8x NVIDIA RTX 4090 48GB (Ada SM89), dual-socket Xeon Gold 6530, 565 GiB RAM, CUDA 13.0, Python 3.12 venv, 8 GPUs over TP8.
+
+### DeepSeek-V4-Flash-0731 (production, `deepseek-v4-flash-0731`)
+
+Official FP4 checkpoint, `--kv-cache-dtype fp8_ds_mla`, TP8, 524288 max-model-len, 4 concurrent seqs, port 18080. DSpark greedy draft is **disabled in production**: on long-context / multi-client usage it amplified output repetition (draft acceptance collapses to 0-5.6% past long contexts), so the server runs without `--speculative-config`.
+
+| Metric | Value |
+| --- | --- |
+| Decode (DSpark off) | ~80 tok/s |
+| Peak GPU memory | ~44.7 GiB / GPU |
+| Context | up to 512k (fp8_ds_mla KV) |
+
+### Qwen3.8-Flash-Next (`qwen4_exp` port, `qwen3.8-flash-next`)
+
+Qwen4Exp 125B MoE + PLE + QSA, official FP8 checkpoint, `--enable-expert-parallel` (TP8 + EP8, 64/512 experts per GPU), BF16 KV cache (QSA requirement), native 262144 max-model-len, chunked prefill 4096, port 18080. Single-request needle-recall benchmark (streaming, temp 0): every tier recovered the marker verbatim with `finish_reason=stop` — no repetition, no truncation, no output degradation.
+
+| Prompt tokens | TTFT | Prefill tok/s | Decode tok/s | Result |
+| --- | --- | --- | --- | --- |
+| 7.8k | 2.1s | 3806 | 40.1 | OK |
+| 31.3k | 8.4s | 3725 | 40.4 | OK |
+| 62.7k | 15.7s | 3995 | 40.1 | OK |
+| 125.4k | 21.6s | 5803 | 74.0 | OK |
+| 191.3k | 45.4s | 4214 | 41.4 | OK |
+| 229.6k | 54.9s | 4180 | 41.5 | OK |
+| 250.6k | 45.3s | 5535 | 87.6 | OK |
+
+Model weights ~23 GiB/GPU, total ~47.7 GiB/GPU at steady state. TTFT/prefill numbers for the first five rows were collected with `CUDA_LAUNCH_BLOCKING=1` (sync kernels, slightly slower); the last two rows are the real async numbers. See [docs/qwen3.8-flash-next-adaptation.md](docs/qwen3.8-flash-next-adaptation.md) for the porting and debugging record.
+
 ## Docker Usage
 
 Prebuilt images are published to Docker Hub on every push:

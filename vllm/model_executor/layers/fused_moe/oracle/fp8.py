@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from enum import Enum
 from typing import Any
 
@@ -266,6 +267,22 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
         f"moe_backend='{runner_backend}' is not supported for FP8 MoE. "
         f"Expected one of {list(mapping.keys())}."
     )
+
+
+
+def refine_fp8_moe_block_shape(
+    config: FusedMoEConfig,
+    weight_block_size: list[int],
+) -> list[int] | None:
+    """Return a finer lossless block grid when TP shards are misaligned."""
+    block_n, block_k = weight_block_size
+    ispp = config.intermediate_size_per_partition
+    if ispp % block_n == 0 and (config.tp_size == 1 or ispp % block_k == 0):
+        return None
+    refine = math.gcd(block_n, block_k, ispp, config.hidden_dim)
+    if refine < 32:
+        return None
+    return [refine, refine]
 
 
 def select_fp8_moe_backend(

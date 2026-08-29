@@ -832,6 +832,15 @@ class RoutedExperts(PluggableLayer):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
+                scale_refine = getattr(self.quant_method, "weight_scale_refine", None)
+                if (
+                    quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+                    and scale_refine is not None
+                ):
+                    # Upsample checkpoint block scales to the refined local grid.
+                    loaded_weight = loaded_weight.repeat_interleave(
+                        scale_refine[0], dim=-2
+                    ).repeat_interleave(scale_refine[1], dim=-1)
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,

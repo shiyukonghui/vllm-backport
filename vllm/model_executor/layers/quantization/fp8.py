@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
+    refine_fp8_moe_block_shape,
     select_fp8_moe_backend,
 )
 from vllm.model_executor.layers.linear import (
@@ -63,7 +64,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
-    kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -482,10 +482,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_scale_name = (
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )
+        self.weight_scale_refine: tuple[int, int] | None = None
+        self.moe_block_shape = self.weight_block_size
 
         # Set weight key and activation key for kernel compatibility
         if self.block_quant:
-            weight_key = kFp8Static128BlockSym
+            assert self.weight_block_size is not None
+            refined_shape = refine_fp8_moe_block_shape(self.moe, self.weight_block_size)
+            if refined_shape is not None:
+                block_n, block_k = self.weight_block_size
+                self.weight_scale_refine = (
+                    block_n // refined_shape[0],
+                    block_k // refined_shape[1],
+                )
+                self.moe_block_shape = refined_shape
+                logger.info_once(
+                    "FP8 MoE block scales refined from %s to %s to fit "
+                    "the TP-sharded intermediate size %d.",
+                    str(self.weight_block_size),
+                    str(refined_shape),
+                    self.moe.intermediate_size_per_partition,
+                )
+            assert self.moe_block_shape is not None
+            weight_key = create_fp8_quant_key(
+                static=True, group_shape=GroupShape(*self.moe_block_shape)
+            )
             activation_key = kFp8Dynamic128Sym
         else:
             weight_key = kFp8StaticTensorSym
@@ -521,29 +542,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.block_quant:
             assert self.weight_block_size is not None
+            assert self.moe_block_shape is not None
+            moe_block_shape = self.moe_block_shape
             layer.weight_block_size = self.weight_block_size
             tp_size = get_tensor_model_parallel_world_size()
             block_n, block_k = (
                 self.weight_block_size[0],
                 self.weight_block_size[1],
             )
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
+            # Checkpoint scales may be losslessly refined when the TP shard is
+            # smaller than the serialized block grid.
             if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
+                if self.weight_scale_refine is None:
+                    raise ValueError(
+                        f"The output_size of gate's and up's weight = "
+                        f"{intermediate_size_per_partition} is not divisible by "
+                        f"weight quantization block_n = {block_n}."
+                    )
+                block_n, block_k = moe_block_shape
             if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
+                if self.weight_scale_refine is None:
+                    raise ValueError(
+                        f"The input_size of down's weight = "
+                        f"{intermediate_size_per_partition} is not divisible by "
+                        f"weight quantization block_k = {block_k}."
+                    )
+                block_n, block_k = moe_block_shape
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -749,7 +773,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
-            block_shape=self.weight_block_size,
+            block_shape=self.moe_block_shape,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             gemm1_alpha=getattr(layer, "swiglu_alpha", None),
             gemm1_beta=getattr(layer, "swiglu_beta", None),
