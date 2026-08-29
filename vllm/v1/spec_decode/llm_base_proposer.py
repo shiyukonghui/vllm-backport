@@ -1387,6 +1387,7 @@ class SpecDecodeBaseProposer:
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",
