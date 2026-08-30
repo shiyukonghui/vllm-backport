@@ -192,7 +192,7 @@ class ParallelConfig:
       with 4 experts and 2 ranks, rank 0 will have experts [0, 2] and rank 1
       will have experts [1, 3]. This strategy can help improve load balancing
       for grouped expert models with no redundant experts."""
-    all2all_backend: All2AllBackend = "flashinfer_nvlink_one_sided"
+    all2all_backend: All2AllBackend = "allgather_reducescatter"
     """All2All backend for MoE expert parallel communication. Available options:
 
     - "allgather_reducescatter": All2all based on allgather and reducescatter
@@ -378,8 +378,8 @@ class ParallelConfig:
 
     With DCP the KV cache is sharded across the group, so the standard MLA decode path
     all-gathers the query every step. Replicating the (small) query projection at load
-    time lets each rank materialize the full group-local head set and skip that 
-    collective, at the cost of computing the projection redundantly on every rank 
+    time lets each rank materialize the full group-local head set and skip that
+    collective, at the cost of computing the projection redundantly on every rank
     in the group.
     """
 

@@ -3,6 +3,7 @@ name: Docker Publish
 on:
   push:
     branches:
+      - master
       - dsv4-a6000-opt
     tags:
       - "v*"

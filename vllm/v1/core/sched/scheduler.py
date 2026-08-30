@@ -965,14 +965,19 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.num_spec_tokens
+                        # Pad only when there is room for the sampled token(s).
                         if (
-                            num_new_tokens > request_token_budget
-                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                            num_computed_tokens
+                            + padded_num_tokens
+                            + self.num_sampled_tokens_per_step
+                            <= self.max_model_len
                         ):
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                            if padded_num_tokens > request_token_budget:
+                                # Prefer to not schedule than schedule un-padded.
+                                break
+                            num_new_tokens = padded_num_tokens
+                            pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
@@ -2892,17 +2897,39 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was already removed (e.g. aborted after a
+                # failed/late KV transfer). Drop the stale completion instead
+                # of crashing the engine.
+                logger.warning(
+                    "Finished recving KV transfer for request %s, but it is "
+                    "no longer tracked (likely aborted). Ignoring.",
+                    req_id,
+                )
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+            elif RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
             else:
-                assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                logger.warning(
+                    "Finished recving KV transfer for request %s in "
+                    "unexpected status %s; ignoring.",
+                    req_id,
+                    req.status,
+                )
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Finished sending KV transfer for request %s, but it is "
+                    "no longer tracked (likely aborted). Ignoring.",
+                    req_id,
+                )
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

@@ -322,6 +322,10 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            # Position-dependent metadata builders need this. GLM-5.3-Flash's
+            # kpool tail maps each token to `own_block * kpool + pos % kpool`,
+            # so without positions it cannot build its slot mapping at all.
+            positions=input_batch.positions,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,

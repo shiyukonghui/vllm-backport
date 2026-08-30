@@ -75,8 +75,9 @@ def _sparse_mla_compute_tile(
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
     offs_dv = tl.arange(0, BLOCK_DV)
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
 
     q = tl.load(
         q_buffer
@@ -86,14 +87,15 @@ def _sparse_mla_compute_tile(
         mask=mask_h[:, None],
         other=0.0,
     )
-    qpe = tl.load(
-        q_buffer
-        + cur_q * stride_q_token
-        + cur_head[:, None] * stride_q_head
-        + offs_dpe[None, :],
-        mask=mask_h[:, None],
-        other=0.0,
-    )
+    if BLOCK_DPE > 0:
+        qpe = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_dpe[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
 
     # Finite sentinel (not -inf) — when an entire BLOCK_N tile is masked,
     # `-inf - -inf = NaN` poisons the softmax; `sentinel - sentinel = 0`
@@ -117,30 +119,31 @@ def _sparse_mla_compute_tile(
         mask_kv = (indices >= 0) & (indices < seq_kv)
 
         offs_k = (
-            indices[None, :] * stride_kv_token
+            indices[None, :].to(tl.int64) * stride_kv_token
             + cur_kv_head_id * stride_kv_head
             + offs_d[:, None]
         )
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
         qk = tl.dot(q, k.to(q.dtype))
 
-        offs_kpe = (
-            indices[None, :] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dpe[:, None]
-        )
-        kpe = tl.load(
-            k_buffer + offs_kpe,
-            mask=mask_kv[None, :],
-            other=0.0,
-        )
-        qk += tl.dot(qpe, kpe.to(q.dtype))
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                indices[None, :].to(tl.int64) * stride_kv_token
+                + cur_kv_head_id * stride_kv_head
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(
+                k_buffer + offs_kpe,
+                mask=mask_kv[None, :],
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
 
         offs_v = (
-            indices[:, None] * stride_kv_token
+            indices[:, None].to(tl.int64) * stride_kv_token
             + cur_kv_head_id * stride_kv_head
             + offs_dv[None, :]
         )
@@ -446,11 +449,15 @@ def triton_mla_sparse_attention(
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
     """
     num_tokens, num_heads_q, dim_qk = q.shape
-    assert dim_qk == _DIM_QK, (
-        f"sparse MLA kernel requires dim_qk={_DIM_QK} (DeepSeek-V3.2 / GLM-5), "
-        f"got {dim_qk}"
+    # DeepSeek-V3.2 / GLM-5 carry a 64-wide RoPE tail (dim_qk 576); GLM-5.3-Flash
+    # is NoPE (qk_rope_head_dim = 0), so dim_qk is just the 512 latent. BLOCK_DPE
+    # = 0 compiles the PE path out of the kernel entirely.
+    assert dim_qk in (_BLOCK_DMODEL, _DIM_QK), (
+        f"sparse MLA kernel requires dim_qk={_BLOCK_DMODEL} (NoPE) or "
+        f"{_DIM_QK} (RoPE), got {dim_qk}"
     )
-    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
+    block_dpe = dim_qk - _BLOCK_DMODEL
+    assert kv.shape[1] == 1 and kv.shape[2] == dim_qk
     index_topk = indices.shape[2]
     assert index_topk % _MIN_BLOCK_N == 0, (
         f"topk ({index_topk}) must be a multiple of the smallest autotune "
@@ -495,7 +502,7 @@ def triton_mla_sparse_attention(
             BLOCK_H=_BLOCK_H,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
-            BLOCK_DPE=_BLOCK_DPE,
+            BLOCK_DPE=block_dpe,
         )
         return out
 
@@ -528,7 +535,7 @@ def triton_mla_sparse_attention(
         BLOCK_H=_BLOCK_H,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
-        BLOCK_DPE=_BLOCK_DPE,
+        BLOCK_DPE=block_dpe,
         LOGE2=LOGE2,
     )
 

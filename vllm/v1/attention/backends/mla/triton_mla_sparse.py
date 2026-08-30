@@ -48,8 +48,9 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             return
         device = self.topk_indices_buffer.device
         topk = self.topk_indices_buffer.shape[-1]
-        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)
-        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
+        dim_qk = self.head_size
+        q = torch.empty(1, self.num_heads, dim_qk, dtype=torch.bfloat16, device=device)
+        kv = torch.empty(64, 1, dim_qk, dtype=torch.bfloat16, device=device)
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -100,6 +101,12 @@ class TritonMLASparseBackend(XPUMLASparseBackend):
         # sizes like 128 usable, which measurably lowers profile-time peak
         # memory for very long contexts.
         return [MultipleOf(64)]
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # 576 = 512 latent + 64 RoPE (DeepSeek-V3.2 / GLM-5).
+        # 512 = NoPE MLA (GLM-5.3-Flash, qk_rope_head_dim = 0).
+        return [512, 576]
 
     @staticmethod
     def get_builder_cls() -> type["TritonMLASparseMetadataBuilder"]:

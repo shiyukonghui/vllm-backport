@@ -775,6 +775,7 @@ class CompilationConfig:
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::sparse_attn_indexer",
+        "vllm::sparse_attn_indexer_kpool",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
@@ -800,6 +801,8 @@ class CompilationConfig:
             "traced_files",
             "compilation_time",
             "encoder_compilation_time",
+            "enabled_custom_ops",
+            "disabled_custom_ops",
             "static_forward_context",
             "pass_config",  # handled separately below
             "dynamic_shapes_config",  # handled separately below

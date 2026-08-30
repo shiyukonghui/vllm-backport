@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -113,6 +114,7 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
+        num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
@@ -158,11 +160,8 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            ratio = spec.block_size // kernel_bs
             seen_ptrs, seg_addrs, seg_block_strides, seg_page_sizes = (
-                per_group.setdefault(
-                    group.kv_cache_group_id, ({}, [], [], [])
-                )
+                per_group.setdefault(group.kv_cache_group_id, ({}, [], [], []))
             )
 
             for layer_name in group.layer_names:
@@ -172,6 +171,12 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
+
+                assert kv.shape[0] % num_blocks == 0, (
+                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
+                    f"multiple of {num_blocks} logical blocks"
+                )
+                ratio = kv.shape[0] // num_blocks
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
@@ -290,11 +295,19 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
-        kv_cache_spec_builder = (
-            self.kv_cache_spec.copy_with_new_block_size(kernel_block_size)
-            if kernel_block_size is not None
-            else self.kv_cache_spec
-        )
+        if kernel_block_size is None:
+            kv_cache_spec_builder = self.kv_cache_spec
+        elif (
+            isinstance(self.kv_cache_spec, MLAAttentionSpec)
+            and self.kv_cache_spec.storage_block_size is not None
+        ):
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                self.kv_cache_spec.storage_block_size
+            )
+        else:
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                kernel_block_size
+            )
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width:
@@ -314,6 +327,9 @@ class AttentionGroup:
             )
             for _ in range(num_metadata_builders)
         ]
+        if kernel_block_size is not None:
+            for builder in self.metadata_builders:
+                builder.set_kernel_block_size(kernel_block_size)
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id
@@ -417,7 +433,13 @@ def allocate_kv_cache(
 
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    buf = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+    raw_size = sizes.pop()
+    page_size = 4096
+    buf = torch.zeros(
+        ((raw_size + page_size - 1) // page_size) * page_size,
+        dtype=torch.int8,
+        device=device,
+    )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -435,6 +457,8 @@ def allocate_kv_cache(
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
+        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
+            kernel_block_size = spec.storage_block_size
 
         views = create_kv_cache_views(
             buf,

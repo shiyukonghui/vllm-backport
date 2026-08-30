@@ -20,6 +20,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.model_executor.models.vision import get_load_balance_assignment
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphConfig,
     EncoderItemSpec,
@@ -270,8 +271,14 @@ class EncoderCudaGraphManager:
             output_buffer = torch.empty_like(output)
 
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(
-            graph, pool=self.graph_pool, capture_error_mode="thread_local"
+        with (
+            torch.inference_mode(),
+            torch.cuda.graph(
+                graph,
+                pool=self.graph_pool,
+                stream=current_stream(),
+                capture_error_mode="thread_local",
+            ),
         ):
             output = self.model.encoder_cudagraph_forward({**values}, path=path)
             output_buffer.copy_(output)
