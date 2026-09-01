@@ -1504,8 +1504,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     seq_lens //= self.compress_ratio
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
+                    # MTP warmup pads seq_lens beyond the active requests, so
+                    # seq_lens can hold num_decode_tokens rows while the
+                    # destination slice above only wants the active decode
+                    # rows; slicing the source keeps padding rows zeroed.
                     self.expanded_seq_lens_buffer[:num_decodes] = (
-                        seq_lens // self.compress_ratio
+                        seq_lens[:num_decodes] // self.compress_ratio
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
