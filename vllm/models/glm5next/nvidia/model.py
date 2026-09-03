@@ -652,6 +652,30 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # PP intermediates carry the full multi-stream mHC state
+        # (tokens, n, hidden_size): every mHC layer's output is a stream
+        # state whose deferred hc_post is materialized at the boundary
+        # (see Glm5NextModel.forward). Mirrors DSV4's hc_mult hand-off.
+        # Only key "hidden_states"; residual/post/comb are re-derived on
+        # the receiving rank by standalone hc_pre.
+        if getattr(self.config, "mhc", False):
+            shape = (
+                batch_size,
+                self.config.mhc_num_residual_streams,
+                self.config.hidden_size,
+            )
+        else:
+            shape = (batch_size, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -670,10 +694,14 @@ class Glm5NextModel(nn.Module):
             comb = None
         else:
             assert intermediate_tensors is not None
+            # The sending rank materialized its last layer's deferred
+            # hc_post, so "hidden_states" arrives as the FULL multi-stream
+            # mHC state (tokens, n * hidden) — the same hand-off DSV4 uses.
+            # The stage's first layer (post is None, layer_idx > 0) re-sets
+            # residual = x in its standalone-hc_pre branch, so no separate
+            # residual key is transported.
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            residual = None
             post = None
             comb = None
 
@@ -687,14 +715,19 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # PP hand-off (DSV4 pattern): materialize this rank's last mHC
+            # layer's deferred hc_post so the full multi-stream state
+            # ([tokens, n, hidden]) crosses the boundary in one key. The
+            # mhc_post kernel here is exactly the post that the next rank's
+            # first layer would have folded into its fused_post_pre, so the
+            # math is unchanged (one extra post kernel per boundary).
+            # post/comb stay None on the receiving rank: its first layer runs
+            # standalone hc_pre on the materialized stream state.
+            if post is not None:
+                hidden_states = self._active_layers[-1].mhc_post_op(
+                    hidden_states, residual, post, comb
+                )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -876,6 +909,11 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # PP is supported: Glm5NextModel transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern).
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1035,9 +1073,13 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        # PP support: the language model transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern). The
+        # Glm4v __init__ (which would alias this automatically) is skipped
+        # above, so alias it explicitly.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding

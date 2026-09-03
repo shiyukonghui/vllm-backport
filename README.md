@@ -10,6 +10,7 @@ Status:
 | `Qwen3.8-27B` | BF16, AWQ W4A16 | Fully Supported (v0.8.0+) |
 | `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | Fully Supported (v0.9.0+) |
 | `GLM-5.3-Flash` | [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.2+) |
+| `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | [Initial Support (Not production tested)](https://github.com/wtdcode/vllm-backport/tree/dsv4-vision-exp)|
 
 Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
