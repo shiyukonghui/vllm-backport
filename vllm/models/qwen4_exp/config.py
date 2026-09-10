@@ -64,6 +64,16 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         rope_theta = kwargs.get("rope_theta", 10_000.0)
+        if layer_types is not None:
+            # transformers >= 5.16 re-serializes the checkpoint's
+            # "full_attention" entries as "qwen_sparse_attention"; accept both
+            # spellings so re-saved checkpoints (e.g. quantized exports) load.
+            layer_types = [
+                "full_attention"
+                if layer_type == "qwen_sparse_attention"
+                else layer_type
+                for layer_type in layer_types
+            ]
         super().__init__(layer_types=layer_types, **kwargs)
 
         normalized_rope_parameters = self.rope_parameters
