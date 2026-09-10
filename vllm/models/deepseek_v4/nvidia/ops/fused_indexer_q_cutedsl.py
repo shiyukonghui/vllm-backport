@@ -40,15 +40,18 @@ def fused_indexer_q_rope_quant_mxfp4_cutedsl(
     num_tokens, num_heads, head_dim = index_q.shape
     rope_dim = index_q_cos_sin_cache.shape[-1]
     rope_type = _TORCH_TO_CUTE[index_q_cos_sin_cache.dtype]
+    weights_type = _TORCH_TO_CUTE[index_weights.dtype]
 
     # compile all variants at first invocation
     for coarsen in (1, 4):
-        IndexerQMxFp4Kernel.compile(head_dim, rope_dim, num_heads, rope_type, coarsen)
+        IndexerQMxFp4Kernel.compile(
+            head_dim, rope_dim, num_heads, rope_type, coarsen, weights_type
+        )
 
     # heuristic
     coarsen = 1 if num_tokens < 512 else 4
     compiled = IndexerQMxFp4Kernel.compile(
-        head_dim, rope_dim, num_heads, rope_type, coarsen
+        head_dim, rope_dim, num_heads, rope_type, coarsen, weights_type
     )
     scale = float(index_weights_softmax_scale * index_weights_head_scale)
     compiled(
@@ -76,13 +79,16 @@ def fused_indexer_q_rope_quant_fp8_cutedsl(
     num_tokens, num_heads, head_dim = index_q.shape
     rope_dim = index_q_cos_sin_cache.shape[-1]
     rope_type = _TORCH_TO_CUTE[index_q_cos_sin_cache.dtype]
+    weights_type = _TORCH_TO_CUTE[index_weights.dtype]
 
     for coarsen in (1, 4):
-        IndexerQFp8Kernel.compile(head_dim, rope_dim, num_heads, rope_type, coarsen)
+        IndexerQFp8Kernel.compile(
+            head_dim, rope_dim, num_heads, rope_type, coarsen, weights_type
+        )
 
     coarsen = 1 if num_tokens < 512 else 4
     compiled = IndexerQFp8Kernel.compile(
-        head_dim, rope_dim, num_heads, rope_type, coarsen
+        head_dim, rope_dim, num_heads, rope_type, coarsen, weights_type
     )
     scale = float(index_weights_softmax_scale * index_weights_head_scale)
     # The cute kernel treats the FP8 buffer as raw bytes (Uint8).
@@ -380,6 +386,9 @@ class IndexerQMxFp4Kernel(IndexerQRopeQuantKernel):
         num_heads: int = 64,
         cos_sin_dtype: type[cutlass.Numeric] = Float32,
         coarsen: int = 4,
+        # bf16 from the separate GEMMs, fp32 when fuse_input_gemm_weights merged
+        # the indexer weight projection into the fp32-output GEMM.
+        weights_dtype: type[cutlass.Numeric] = BFloat16,
     ):
         num_tokens = cute.sym_int()
         max_pos = cute.sym_int()
@@ -393,7 +402,9 @@ class IndexerQMxFp4Kernel(IndexerQRopeQuantKernel):
             (max_pos, rope_dim),
             divisibility=8,
         )
-        weights = make_fake_tensor(BFloat16, (num_tokens, num_heads), divisibility=8)
+        weights = make_fake_tensor(
+            weights_dtype, (num_tokens, num_heads), divisibility=8
+        )
         q_fp4 = make_fake_tensor(
             Uint8,
             (num_tokens, num_heads, head_dim // 2),
@@ -571,6 +582,9 @@ class IndexerQFp8Kernel(IndexerQRopeQuantKernel):
         num_heads: int = 64,
         cos_sin_dtype: type[cutlass.Numeric] = Float32,
         coarsen: int = 4,
+        # bf16 from the separate GEMMs, fp32 when fuse_input_gemm_weights merged
+        # the indexer weight projection into the fp32-output GEMM.
+        weights_dtype: type[cutlass.Numeric] = BFloat16,
     ):
         num_tokens = cute.sym_int()
         max_pos = cute.sym_int()
@@ -584,7 +598,9 @@ class IndexerQFp8Kernel(IndexerQRopeQuantKernel):
             (max_pos, rope_dim),
             divisibility=8,
         )
-        weights = make_fake_tensor(BFloat16, (num_tokens, num_heads), divisibility=8)
+        weights = make_fake_tensor(
+            weights_dtype, (num_tokens, num_heads), divisibility=8
+        )
         q_fp8 = make_fake_tensor(
             Uint8,
             (num_tokens, num_heads, head_dim),

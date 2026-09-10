@@ -789,6 +789,7 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
+        self._indexer = indexer
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).
@@ -1036,9 +1037,15 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
         num_actual_toks = attn_metadata.num_actual_tokens
 
         # Get topk indices
-        assert self.topk_indices_buffer is not None
+        # Read the indexer's buffer live: MTP+PP may swap it after construction.
+        buf = (
+            self._indexer.topk_indices_buffer
+            if self._indexer is not None
+            else self.topk_indices_buffer
+        )
+        assert buf is not None, "topk_indices_buffer required for sparse MLA"
         topk_indices = fit_kpool_indices_to_aiter(
-            self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
+            buf[:num_actual_toks], attn_metadata.topk_tokens
         )
 
         triton_convert_req_index_to_global_index(
