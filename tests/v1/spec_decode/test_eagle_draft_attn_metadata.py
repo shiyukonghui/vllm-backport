@@ -38,6 +38,7 @@ def _make_fake_speculator(
         query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32),
         seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
         dcp_local_seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
+        positions=torch.arange(max_num_tokens, dtype=torch.int64),
     )
     fake_block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],
@@ -99,6 +100,25 @@ def test_build_draft_attn_metadata_sets_seq_lens_cpu_upper_bound():
     assert bound.dtype == torch.int32
     # base[:num_reqs] + step, padded tail zeroed.
     assert torch.equal(bound, torch.tensor([102, 202, 302, 0], dtype=torch.int32))
+
+
+def test_build_draft_attn_metadata_sets_positions():
+    """Builders with position-derived slot mappings (e.g. the kpool tail
+    ring buffer) read ``positions`` off the per-step metadata."""
+    fake = _make_fake_speculator()
+
+    captured = _run_build(
+        fake,
+        num_reqs=3,
+        num_reqs_padded=4,
+        num_tokens_padded=5,
+        base=torch.tensor([100, 200, 300, 0], dtype=torch.int32),
+        step=2,
+    )
+
+    positions = captured["positions"]
+    assert isinstance(positions, torch.Tensor)
+    assert torch.equal(positions, fake.input_buffers.positions[:5])
 
 
 def test_build_draft_attn_metadata_handles_zero_unpadded_reqs():

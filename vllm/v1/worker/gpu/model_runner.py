@@ -68,6 +68,7 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -586,7 +587,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
+            # KpoolTailSpec has its own ring-buffer slot mapping
+            # (KpoolTailMetadataBuilder); the generic position-indexed mapping
+            # would read far beyond its 1-block table row (e.g. pos 130559 // 4
+            # vs a 32-wide row) and crash with an illegal memory access.
+            slot_mapping_enabled.append(
+                not isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
+            )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -1647,9 +1654,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
+            #
+            # Pass the SOURCE per-request-slot block tables, not the per-step
+            # gathered views: the mamba spec-decode context captures these
+            # tensors' data_ptrs once and its copy kernels index rows by
+            # req_idx (mamba_utils.py). Gathered views are batch-ordered and
+            # re-gathered every step, so under PP a deferred postprocess on a
+            # non-last rank would walk another step's batch mapping through
+            # freed/reallocated block ids.
             self.model_state.preprocess_state(
                 input_batch,
-                block_tables,
+                tuple(bt.gpu for bt in self.block_tables.block_tables),
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
@@ -1992,7 +2007,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        # The encoder runner exists only on the first PP rank, so later ranks
+        # have no cached embeddings to gather.
+        if (
+            self.speculator is not None
+            and self.speculator.supports_mm_inputs
+            and self.model_state.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
