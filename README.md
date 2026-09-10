@@ -64,7 +64,7 @@ services:
       - --host=127.0.0.1
       - --port=5556
       - --http-port=18556
-      - --chunk-size=800
+      - --chunk-size=1024 # must be a multiple of the model's KV block size: 1024 for DeepSeek-V4, 800 for Qwen3.8-Flash-Next, 1152 for GLM-5.3-Flash (see the model sections)
       - --separate-object-groups
       - --l1-size-gb=1024
       - --eviction-policy=LRU
@@ -153,7 +153,7 @@ vllm serve /path/to/your/qwen3.8 \
   --mamba-cache-mode=align \
 ```
 
-- `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
+- `VLLM_PLE_CPU_OFFLOAD=1` (alias of `--engram-config '{"cpu_offload": true}'` since v0.13.0) keeps the 51B n-gram embedding in pinned host RAM (fp8 ~51 GiB for the FP8 checkpoint, bf16 ~102 GiB for the AWQ one) and looks rows up through UVA. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 
