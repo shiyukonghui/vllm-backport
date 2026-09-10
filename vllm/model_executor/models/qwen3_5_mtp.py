@@ -152,7 +152,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        # The drafter is built with PP=1 and runs on the target's last PP rank,
+        # where get_pp_group() still describes the target pipeline. Both the
+        # first and the last rank therefore project the target hidden states
+        # through fc; only middle ranks consume intermediate tensors.
+        if pp_group.is_first_rank or pp_group.is_last_rank:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
