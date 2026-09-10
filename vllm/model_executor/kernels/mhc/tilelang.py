@@ -2,7 +2,48 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# The prenorm GEMM is L2-bound on re-reads of `fn`, not CUDA-core bound: at
+# (block_m=2, tile_n=12) it moves 1.745 GB in 472.7 us = 3.69 TB/s, near the L2
+# read ceiling, with only 18.2% of the fp32 pipe busy. `fn` traffic scales
+# 1/block_m and `x` traffic scales 1/tile_n, and `fn` is 12x larger, so raising
+# block_m is the lever — but the traffic model alone does not pick the winner.
+# Swept on A100 (benchmark_dsv4_sm80.py --kernel prenorm-gemm): (8, 4) is
+# fastest at T<=256 yet collapses above 1024 (620 us at T=2048 vs 459 for the
+# old (2, 12)); (8, 6) is within 5% of the best measured config at every T from
+# 64 to 2048 (26.9 us @128, 201.6 @1024, 442.2 @2048) and is the keeper.
+_PRENORM_BLOCK_M = 8
+_PRENORM_BLOCK_M_TILE_N = 6
+
+# Below this many tokens the one-CTA-per-token tilelang kernel wins on launch
+# latency (7.0 us at T=1 vs 10.5 for cuBLAS); at and above it the cuBLAS
+# route wins (T=32 is a dead heat at 16.8 vs 16.7 us, then 31.8 vs 17.4 at
+# T=64 and 442 vs 85 at T=2048). Measured crossover at T=32.
+_PRENORM_SMALL_T = 32
+
+# Escape hatch: routing back to the fused tilelang (8, 6) kernel if the
+# cuBLAS route misbehaves on some stack. Numerics differ between the two
+# (bf16 fn vs fp32 fn); the parity test covers both.
+_PRENORM_USE_CUBLAS = True
+
+# On the cuBLAS route the sqrsum is a second full read of the post-mapped
+# residual (_row_sqrsum_kernel: 135 us x 86 calls = 11.6 ms of an 8K prefill,
+# at the HBM ceiling, so nothing is left to tune inside it). mhc_post holds
+# those values in registers one kernel earlier, so folding the reduction in
+# there removes the pass and a launch: measured 498.9 -> 350.6 us at T=8192.
+# Read per call rather than at import so a serving A/B only needs a restart.
+
+# (tile_n, split_k, n_thr) for the small-token fused post+prenorm kernel.
+# Swept over the full product at the shapes decode runs (m=5, 6, 12, 16;
+# benchmark_dsv4_sm80.py --kernel mhc-fused). Scored on the *pair*, because
+# split_k becomes the n_splits the pre kernel then reduces serially -- that
+# coupling costs only 0.41 us going from 8 splits to 32, so it is close to
+# free. Boundary pair at m=6: 13.73 us at the old (2, 8, 256) against 11.88
+# here, -13.5%; the config also wins at m=5, 12 and 16. Same kernel and same
+# arithmetic as before, so numerics are untouched (rel err 2.9e-07 either way).
+_SMALL_FMA_CONFIG = (6, 16, 128)
 
 
 def _torch_hc_prenorm_gemm(
@@ -28,7 +69,15 @@ def _tilelang_hc_prenorm_gemm(
     tile_n: int = 12,
     n_thr: int = 512,
     n_splits: int = 1,
+    sqrsum_ready: bool = False,
 ) -> None:
+    """Route the prenorm GEMM.
+
+    ``sqrsum_ready`` says the caller already filled ``sqrsum``; only the cuBLAS
+    route, where the reduction is a separate pass over ``x``, can act on it.
+    The other routes produce the same values as a side effect of work they do
+    anyway, so they ignore the flag and overwrite.
+    """
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         hc_prenorm_gemm_block_m_tilelang,
         hc_prenorm_gemm_tilelang,
@@ -38,26 +87,16 @@ def _tilelang_hc_prenorm_gemm(
     assert sqrsum.shape[0] == n_splits
     assert x.shape[1] == hc_mult * hidden_size
     assert x.shape[1] % n_splits == 0
-    assert (x.shape[1] // n_splits) % n_thr == 0
-    use_default_config = tile_n == 12 and n_thr == 512
-    if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
-        hc_prenorm_gemm_block_m_tilelang(
-            x,
-            fn,
-            out,
-            sqrsum,
-            hidden_size,
-            hc_mult,
-            fn.shape[0],
-            n_thr,
-            tile_n,
-            2,
-        )
+    if (x.shape[1] // n_splits) % n_thr != 0:
+        # Shape the tilelang kernels cannot tile; the prenorm GEMM output is
+        # tiny ([T, hc_mult3] + [T]), so torch is a cheap universal fallback.
+        _torch_hc_prenorm_gemm(x, fn, out, sqrsum)
         return
+    use_default_config = tile_n == 12 and n_thr == 512
     if (
         n_splits == 1
         and use_default_config
-        and x.shape[0] < 128
+        and x.shape[0] < _PRENORM_SMALL_T
         and x.shape[1] % 1024 == 0
     ):
         hc_prenorm_gemm_tilelang(
@@ -71,6 +110,32 @@ def _tilelang_hc_prenorm_gemm(
             1024,
             4,
             n_splits,
+        )
+        return
+    if n_splits == 1 and x.dtype == torch.bfloat16 and _PRENORM_USE_CUBLAS:
+        # cuBLAS bf16 GEMM + one-pass sqrsum: 17.4 us at T=64, 85 at T=2048
+        # vs 26.2 / 442 for the best fused tilelang config (8, 6) — the fused
+        # kernels re-read fn per token tile and are L2-bound at large T. The
+        # block_m tilelang route below stays in-tree (tested and benched) as
+        # the escape.
+        from vllm.model_executor.kernels.mhc.triton import hc_prenorm_gemm_cublas
+
+        hc_prenorm_gemm_cublas(x, fn, out, None if sqrsum_ready else sqrsum)
+        return
+    if n_splits == 1 and use_default_config:
+        # No upper token-count gate: num_tokens is dynamic and the kernel guards
+        # token_idx < num_tokens, so this is correct at any T.
+        hc_prenorm_gemm_block_m_tilelang(
+            x,
+            fn,
+            out,
+            sqrsum,
+            hidden_size,
+            hc_mult,
+            fn.shape[0],
+            n_thr,
+            _PRENORM_BLOCK_M_TILE_N,
+            _PRENORM_BLOCK_M,
         )
         return
     hc_prenorm_gemm_tilelang(
@@ -348,7 +413,13 @@ def mhc_pre_broadcast_tilelang(
     residual_flat = residual
     num_tokens = residual.shape[0]
 
-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    use_deep_gemm = is_deep_gemm_supported()
+    if use_deep_gemm:
+        n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    else:
+        n_splits = 1
 
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
@@ -369,15 +440,26 @@ def mhc_pre_broadcast_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+    if use_deep_gemm:
+        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
-    tf32_hc_prenorm_gemm(
-        residual_flat,
-        fn_broadcast,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+        tf32_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        # Broadcast GEMM has K = hidden_size (hc_mult factor is 1).
+        _tilelang_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hidden_size,
+            1,
+        )
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -517,9 +599,18 @@ def mhc_fused_post_pre_tilelang(
     use_deep_gemm = is_deep_gemm_supported()
     use_small_fma = num_tokens <= 16
     if use_small_fma:
-        # TODO(gnovack): investigate autotuning these heuristics
-        tile_n = 2 if num_tokens < 8 else 3
-        n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+        tile_n, n_splits, fma_n_thr = _SMALL_FMA_CONFIG
+        if (
+            hc_mult3 % tile_n
+            or hidden_size % n_splits
+            or (hidden_size // n_splits) % fma_n_thr
+        ):
+            # The kernel walks its h slice in whole n_thr strides and drops any
+            # remainder, so a shape the swept config cannot tile exactly has to
+            # fall back rather than silently compute part of the reduction.
+            tile_n = 2 if num_tokens < 8 else 3
+            n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+            fma_n_thr = 256
     else:
         if use_deep_gemm:
             # these number are from deepgemm kernel impl
@@ -577,21 +668,40 @@ def mhc_fused_post_pre_tilelang(
             hc_mult,
             hidden_size,
             hc_mult3,
-            tile_n=tile_n,
-            n_splits=n_splits,
+            fma_n_thr,
+            256,
+            tile_n,
+            n_splits,
         )
     else:
-        mhc_post_tilelang(
-            comb_res_mix_flat,
-            residual_flat,
-            post_layer_mix_flat,
-            x_flat,
-            residual_cur,
-            residual.shape[-2],
-            residual.shape[-1],
-        )
-
         residual_cur_2d = residual_cur.view(num_tokens, hc_mult * hidden_size)
+        fuse_sqrsum = envs.VLLM_MHC_POST_FUSE_SQRSUM and not use_deep_gemm
+        if fuse_sqrsum:
+            from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+                mhc_post_sqrsum_tilelang,
+            )
+
+            mhc_post_sqrsum_tilelang(
+                comb_res_mix_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                x_flat,
+                residual_cur,
+                gemm_out_sqrsum,
+                residual.shape[-2],
+                residual.shape[-1],
+            )
+        else:
+            mhc_post_tilelang(
+                comb_res_mix_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                x_flat,
+                residual_cur,
+                residual.shape[-2],
+                residual.shape[-1],
+            )
+
         if use_deep_gemm:
             from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
@@ -610,6 +720,7 @@ def mhc_fused_post_pre_tilelang(
                 gemm_out_sqrsum,
                 hidden_size,
                 hc_mult,
+                sqrsum_ready=fuse_sqrsum,
             )
 
     if norm_weight is None:
