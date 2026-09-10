@@ -299,8 +299,13 @@ class FusedIndexerQRopeQuantTritonKernel(
             index_q_cos_sin_stride=index_q_cos_sin_cache.stride(0),
             INDEX_Q_HALF_ROT_DIM=index_q_cos_sin_cache.shape[-1] // 2,
             # uint8 view: an fp8-typed pointer arg would make Triton reject
-            # the kernel below SM89; the kernel stores raw encoded bytes.
-            index_q_fp8_ptr=index_q_fp8.view(torch.uint8),
+            # the kernel below SM89; the kernel stores raw encoded bytes. The
+            # warmup stand-in is already declared as uint8 (no .view()).
+            index_q_fp8_ptr=(
+                index_q_fp8.view(torch.uint8)
+                if isinstance(index_q_fp8, torch.Tensor)
+                else index_q_fp8
+            ),
             index_q_fp8_stride0=index_q_fp8.stride(0),
             index_q_fp8_stride1=index_q_fp8.stride(1),
             INDEX_Q_HEAD_DIM=index_q.shape[2],

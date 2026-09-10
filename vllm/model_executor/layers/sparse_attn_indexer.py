@@ -1003,11 +1003,8 @@ class SparseAttnIndexer(CustomOp):
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
-            _PACK_SEQ_TRITON_KERNEL.register_warmup(
-                dtype=pack_dtype,
-                pad_value=0 if use_fp4_cache else -float("inf"),
-            )
+            # pack_seq_triton packs fp8 (and MXFP4) queries as raw bytes.
+            _PACK_SEQ_TRITON_KERNEL.register_warmup(dtype=torch.uint8, pad_value=0)
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 
             if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():

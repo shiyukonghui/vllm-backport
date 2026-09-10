@@ -474,11 +474,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             backend_name = self.backend_cls.get_name()
             if current_platform.is_cuda():
-                from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (  # noqa: E501
-                    _FUSED_INV_ROPE_FP8_QUANT_KERNEL,
-                )
+                if backend_name != "TRITON_MLA_SPARSE_DSV4":
+                    # The SM8x path runs o_proj through rocm_inv_rope_einsum
+                    # and never calls this kernel, whose native fp8 stores do
+                    # not compile below SM89.
+                    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (  # noqa: E501
+                        _FUSED_INV_ROPE_FP8_QUANT_KERNEL,
+                    )
 
-                _FUSED_INV_ROPE_FP8_QUANT_KERNEL.register_warmup()
+                    _FUSED_INV_ROPE_FP8_QUANT_KERNEL.register_warmup()
 
                 if self.compress_ratio == 128:
                     from vllm.models.deepseek_v4.sparse_mla import (
