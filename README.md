@@ -10,12 +10,9 @@ Status:
 | `Qwen3.8-27B` | BF16, AWQ W4A16 | Fully Supported (v0.8.0+) |
 | `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | Fully Supported (v0.9.0+) |
 | `GLM-5.3-Flash` | [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.2+) |
-| `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | Fully Supported (v0.13.0+) |
-| `DeepSeek-V4.1-Flash` | Native FP4 (experts) + MXFP8 | Initial Support (v0.13.0+) |
+| `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | [Initial Support (Not production tested)](https://github.com/wtdcode/vllm-backport/tree/dsv4-vision-exp)|
 
-Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docker images.** Every model above is verified with it (see the per-model LMCache notes below).
-
-v0.13.0 is rebased onto upstream vLLM `93911fcf68` (2026-09-10); every fork change was re-applied on top of it.
+Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
 ## Docker Usage
 
@@ -26,11 +23,11 @@ Prebuilt images are published to Docker Hub on every push:
 | `lazymio/vllm-backport:latest-sm86` (also `:latest`) | Ampere sm86 (A6000, RTX 30xx) |
 | `lazymio/vllm-backport:latest-sm80` | Ampere sm80 (A100) |
 | `lazymio/vllm-backport:latest-sm89` | Ada sm89 (RTX 4090, L40S) |
-| `lazymio/vllm-backport:v0.13.0-sm86` / `-sm80` / `-sm89` | pinned release builds |
+| `lazymio/vllm-backport:v0.11.2-sm86` / `-sm80` / `-sm89` | pinned release builds |
 
 Images are single-arch builds (no FA3/Hopper kernels), so pick the tag matching your GPU. The entrypoint is `vllm serve` and `lmcache` is also available within the same image!
 
-`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.13.0-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
+`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.11.2-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
 
 ### Docker Compose Sample
 
@@ -67,7 +64,7 @@ services:
       - --host=127.0.0.1
       - --port=5556
       - --http-port=18556
-      - --chunk-size=1024 # must be a multiple of the model's KV block size: 1024 for DeepSeek-V4, 800 for Qwen3.8-Flash-Next, 1152 for GLM-5.3-Flash (see the model sections)
+      - --chunk-size=800
       - --separate-object-groups
       - --l1-size-gb=1024
       - --eviction-policy=LRU
@@ -129,7 +126,6 @@ vllm serve wtdcode/GLM-5.3-Flash-AWQ-W4A16 \
 
 - Verified with MTP-3 on 4x A100-80GB (sm80). On 8x RTX A6000 (sm86) use `--tensor-parallel-size 8` and drop `--gpu-memory-utilization` to 0.85 — with the MTP draft loaded, 0.9+ OOMs during cudagraph warmup on 48 GB cards.
 - Serving directly from the Hugging Face repository ID works; no manual snapshot-path resolution is needed.
-- With LMCache: the unified KV block size is 1152, so run `lmcache server --chunk-size 1152 --separate-object-groups ...` and add `--prefix-cache-retention-interval 1152 --max-num-batched-tokens 1152` (the LMCache fork rejects MTP + align-mode hybrids with a larger batch budget) plus the `--kv-transfer-config` from the compose sample.
 
 #### Qwen3.8-Flash-Next (v0.9.0+)
 
@@ -157,9 +153,8 @@ vllm serve /path/to/your/qwen3.8 \
   --mamba-cache-mode=align \
 ```
 
-- `VLLM_PLE_CPU_OFFLOAD=1` (alias of `--engram-config '{"cpu_offload": true}'` since v0.13.0) keeps the 51B n-gram embedding in pinned host RAM (fp8 ~51 GiB for the FP8 checkpoint, bf16 ~102 GiB for the AWQ one) and looks rows up through UVA. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
+- `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
-- With LMCache: the unified KV block size is 800, so run `lmcache server --chunk-size 800 --separate-object-groups ...` and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` (MTP + align mode) plus the `--kv-transfer-config` from the compose sample. Verified: a 12k-token prompt is fully served from LMCache after an engine restart.
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 
 #### DeepSeek V4 Flash
@@ -182,37 +177,3 @@ vllm serve /path/to/your/deepseek \
 - Keep `num_speculative_tokens` at 5 on Ampere. Values below 5 (the checkpoint's `dspark_block_size`) are rejected, and 7 needs ~200 KB of shared memory vs the 163 KB Ampere limit (`triton OutOfResources` error). 6 does start, but draft positions past the native block are almost never accepted (3–13% in our measurements), so it only wastes draft compute — output quality and speed are the same as 5.
 - Requests that set neither `thinking` nor `reasoning_effort` now get thinking mode with high effort, matching the official 0731 API mapping (`reasoning_effort: "none"` restores plain chat mode). Agentic/tool-calling clients should pass a `reasoning_effort` explicitly from the first turn of a session — sessions that run without the effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops.
 - `--hf-overrides '{"head_dtype": "float32"}'` once helped reduce garbage outputs by improving precisions but might be not compulsory.
-- With LMCache: the KV block size is 256, so the LMCache chunk size must be a multiple of it (`--chunk-size 1024` in the compose sample) and vLLM needs `--prefix-cache-retention-interval 1024` (the LMCache fork requires a state checkpoint at every chunk boundary for the sliding-window groups). On 4x A100-80GB use `--tensor-parallel-size 4 --max-model-len 262144`.
-
-#### DeepSeek V4 Flash Vision-Exp (v0.13.0+)
-
-Same command as DeepSeek V4 Flash with the Vision-Exp checkpoint; the multimodal wrapper is selected automatically from `vision_n_layers` in the config. Differences:
-
-- `--speculative-config '{"method":"dspark","num_speculative_tokens":3}'`: this checkpoint's `dspark_block_size` is 3, so the draft length must be a multiple of 3.
-- Images go through the standard OpenAI `image_url` content parts. Verified on 4x A100-80GB (TP4, `--max-model-len 131072`) with LMCache (`--prefix-cache-retention-interval 1024`, chunk 1024): text, tool calls, image description and DSpark (mean acceptance length 3.6).
-
-#### DeepSeek V4.1 Flash (v0.13.0+)
-
-```bash
-vllm serve /path/to/DeepSeek-V4.1-Flash \
-  --tensor-parallel-size 8 \
-  --max-model-len 262144 \
-  --max-num-seqs 16 \
-  --max-num-batched-tokens 4096 \
-  --gpu-memory-utilization 0.90 \
-  --kv-cache-dtype fp8_ds_mla \
-  --engram-config '{"cpu_offload": true}' \
-  --trust-remote-code \
-  --disable-custom-all-reduce \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16,32,64],"max_cudagraph_capture_size":64}' \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
-  --tokenizer-mode deepseek_v41 \
-  --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 \
-  --host 0.0.0.0 --port 8000 \
-  --served-model-name deepseek-v4.1-flash
-```
-
-- Ported from upstream PR [vllm-project/vllm#56214](https://github.com/vllm-project/vllm/pull/56214) with an SM8x route (`TRITON_MLA_SPARSE_DSV41`, the default on Ampere): the Triton sparse-MLA prefill/decode kernels, fp8 cache encode/decode without native e4m3 converts, Marlin for the MXFP4 experts and the MXFP8 dense layers, and the `wo_a` grouped-LoRA weight dequantized to BF16 at load.
-- The two Engram n-gram tables (189 GiB total) are kept in pinned host RAM by default (`--engram-config '{"cpu_offload": true}'`, ~12 GiB per rank per table at TP8) and looked up through UVA; the checkpoint itself is 475 GiB, so 8x 80 GB cards are the minimum.
-- `method: "mtp"` is rejected for this checkpoint; use DSpark (`dspark_block_size` is 5).
-
