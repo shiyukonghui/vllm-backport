@@ -365,6 +365,9 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Hit blocks pinned in the primary tier between lookup and prepare_load
+    # (see OffloadingManager.reserve_hits); released exactly once.
+    reserved_keys: list[OffloadKey] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -706,6 +709,13 @@ class OffloadingConnectorScheduler:
                 return idx + required_window if not defer_lookup else None
         return consecutive_hits if not defer_lookup else None
 
+    def _release_reservation(self, req_status: RequestOffloadState) -> None:
+        if req_status.reserved_keys:
+            self.manager.release_reservation(
+                req_status.reserved_keys, req_status.req_context
+            )
+            req_status.reserved_keys = []
+
     def _touch(self, req_status: RequestOffloadState):
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -1044,12 +1054,28 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
+        # Re-reserve for this pass: pin every hit block so a concurrent
+        # store's eviction cannot invalidate the hit count we are about to
+        # promise to the vLLM scheduler (prepare_load would assert-crash).
+        self._release_reservation(req_status)
+        if num_hit_tokens:
+            reserve: list[OffloadKey] = []
+            for group_state in req_status.group_states:
+                reserve.extend(group_state.offload_keys[: group_state.num_hit_chunks])
+            if reserve:
+                req_status.reserved_keys = self.manager.reserve_hits(
+                    reserve, req_status.req_context
+                )
+
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         if num_external_tokens == 0:
+            req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                self._release_reservation(req_status)
             return
 
         req_status = self._req_status[request.request_id]
@@ -1135,6 +1161,8 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = num_chunks
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        # prepare_load holds its own pins now; drop the lookup-time reservation.
+        self._release_reservation(req_status)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
@@ -1746,6 +1774,7 @@ class OffloadingConnectorScheduler:
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
+                self._release_reservation(self._req_status[req_id])
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
@@ -1838,6 +1867,7 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
+                self._release_reservation(self._req_status[job_status.req_id])
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1924,6 +1954,7 @@ class OffloadingConnectorScheduler:
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
+                self._release_reservation(self._req_status[req_id])
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
