@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -190,6 +191,9 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
+_PIN_SPAN_BYTES = 1 << 30
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
@@ -201,23 +205,126 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         return
 
     rank = region.rank
+    if rank is None:
+        return
 
-    base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
-    if result.value != 0:
+    if os.environ.get("VLLM_KV_OFFLOAD_SKIP_PIN") == "1":
         logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
+            "VLLM_KV_OFFLOAD_SKIP_PIN=1: leaving the offload region unpinned "
+            "(diagnostic knob; transfers will fail or crawl)"
         )
-    else:
-        logger.debug(
-            "cudaHostRegister rank=%d %.2f GB",
-            rank,
-            region.total_size_bytes / 1e9,
+        return
+
+    # The region is shared by every worker process, and the CUDA driver only
+    # lets the FIRST process cudaHostRegister a given physical page - later
+    # registrations from sibling ranks fail with cudaErrorInvalidValue and the
+    # unpinned fallback then crashes the UVA transfer kernels at warmup.
+    # Register only the slots owned by this rank (disjoint across ranks).
+    base_ptr = region._base.data_ptr()
+    slot_size = region._worker_area_end - region._worker_offset
+    # The driver caps the *number* of host registrations (about 2^18 across
+    # the GPUs of a node), not the bytes: one ~1 MB registration per chunk
+    # tops out at ~250 GB. When this worker owns whole rows (a single worker
+    # per row, e.g. DP/TP=1) its slots are contiguous, so register them in
+    # large chunks instead. Interleaved layouts (TP>1) keep one registration
+    # per slot because a page may only be registered by one process.
+    # (row_stride is page-padded, so test "only one slot fits in a row".)
+    contiguous = region._worker_offset == 0 and region._row_stride < 2 * slot_size
+    span_chunks = max(1, _PIN_SPAN_BYTES // slot_size) if contiguous else 1
+    cudart = torch.cuda.cudart()
+    registered: list[int] = []
+    had_failed_attempt = False
+    _t0 = time.perf_counter()
+    for chunk in range(0, region.num_chunks, span_chunks):
+        n_chunks = min(span_chunks, region.num_chunks - chunk)
+        off = chunk * region._row_stride + region._worker_offset
+        reg_size = slot_size if n_chunks == 1 else n_chunks * region._row_stride
+        # Transient failures happen under memory pressure (concurrent ranks
+        # pinning + model weights loading); retry before giving up.
+        for attempt in range(4):
+            result = cudart.cudaHostRegister(base_ptr + off, reg_size, 0)
+            if result.value == 0:
+                break
+            # NOTE: a failed runtime call also records itself in this
+            # thread's CUDA *last-error* slot. torch only reads that slot in
+            # its kernel-LAUNCH checks, so if it is not consumed the stale
+            # error resurfaces minutes later as a bogus AcceleratorError on
+            # the first launch-checked op (historically: the zero_() fill in
+            # warmup or add_request) and kills the boot. The fence after this
+            # loop consumes it; log the real failure here, at its origin.
+            had_failed_attempt = True
+            logger.warning(
+                "cudaHostRegister rank=%d chunk=%d attempt=%d failed with "
+                "code=%d; retrying",
+                rank,
+                chunk,
+                attempt,
+                result.value,
+            )
+            # Consume the stale last-error IMMEDIATELY, not just in the
+            # post-loop fence: on this code base NCCL collectives can run
+            # interleaved with registration, and NCCL's internal error
+            # checks inherit the stale code as "unhandled cuda error",
+            # killing the boot before the fence ever runs.
+            try:
+                _probe = torch.zeros(1, device="cuda")
+                _probe += 1
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            time.sleep(0.5 * (attempt + 1))
+        if result.value != 0:
+            for done in registered:
+                cudart.cudaHostUnregister(base_ptr + done)
+            # Unpinned is not a usable fallback: the UVA transfer kernels
+            # dereference these host pointers and crash later with an async
+            # cudaErrorInvalidValue far from this code. Fail fast instead.
+            raise RuntimeError(
+                f"cudaHostRegister failed for rank={rank} at chunk {chunk}/"
+                f"{region.num_chunks} (code={result.value}) after retries. "
+                "This usually means host memory pressure or insufficient "
+                "free /dev/shm. Check for stale vllm_offload_*.mmap files "
+                "and overall RAM usage."
+            )
+        registered.append(off)
+    region._pinned_slot_offsets = registered
+    region.is_pinned = True
+    logger.info(
+        "cudaHostRegister rank=%d pinned %d chunks in %d registrations "
+        "(%.2f GB) in %.1fs",
+        rank,
+        region.num_chunks,
+        len(registered),
+        region.num_chunks * slot_size / 1e9,
+        time.perf_counter() - _t0,
+    )
+
+    # Launch-check fence: force a kernel-launch error check NOW so that any
+    # stale last-error recorded during the registration phase (e.g. by a
+    # cudaHostRegister attempt that we retried successfully) is attributed
+    # and consumed here instead of poisoning the first launch-checked op of
+    # warmup minutes later (the boot-time "async cudaErrorInvalidValue"
+    # crash: torch.AcceleratorError at zero_()/torch.zeros with no real
+    # device fault behind it).
+    try:
+        probe = torch.zeros(8, device="cuda")
+        probe += 1
+        torch.cuda.synchronize()
+    except Exception as exc:
+        logger.warning(
+            "Consumed a stale CUDA error left over from the host "
+            "registration phase (had_failed_attempt=%s): %s -- verifying "
+            "the device is actually healthy.",
+            had_failed_attempt,
+            exc,
         )
-        region.is_pinned = True
+        # A stale last-error is cleared by the read above; a genuinely
+        # broken context is not. Re-probe: if this also fails, the device
+        # is truly poisoned and the boot must die (fail fast).
+        probe = torch.zeros(8, device="cuda")
+        probe += 1
+        torch.cuda.synchronize()
+        logger.info("Device healthy after clearing stale CUDA error; continuing boot.")
 
 
 def _new_descriptor_buffers(

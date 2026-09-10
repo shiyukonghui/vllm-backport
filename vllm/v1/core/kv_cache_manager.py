@@ -813,25 +813,34 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[list[int]]:
+        """Drain and return new attention block IDs for zeroing, per
+        kv-cache group.
+
+        Block ids are only meaningful within their own group: with virtual
+        block splitting, the same id maps to different physical pages in
+        groups with different block geometries, so a flat cross-group list
+        would wipe live blocks of other groups (#50576).
+        """
+        return [
+            mgr.take_new_block_ids() for mgr in self.coordinator.single_type_managers
+        ]
 
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int
-    ) -> list[int]:
-        """The request's block ids covering [start_token, end_token), from
-        the groups whose new blocks are zeroed by the worker."""
-        ids: list[int] = []
+    ) -> list[list[int]]:
+        """The request's block ids covering [start_token, end_token), per
+        kv-cache group; empty for groups whose new blocks the worker does
+        not zero."""
+        ids: list[list[int]] = []
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
                 start_idx = start_token // mgr.block_size
                 end_idx = cdiv(end_token, mgr.block_size)
                 blocks = mgr.req_to_blocks[request_id]
-                ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
+                ids.append([blk.block_id for blk in blocks[start_idx:end_idx]])
+            else:
+                ids.append([])
         return ids
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:

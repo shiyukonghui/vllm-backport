@@ -30,6 +30,16 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
+def compute_worker_kv_bytes_per_block(kv_cache_config: "KVCacheConfig") -> int:
+    """Per-worker KV bytes per block from this worker's kv_cache_config."""
+    if kv_cache_config.num_blocks <= 0 or not kv_cache_config.kv_cache_tensors:
+        return 0
+    # Every KVCacheTensor describes placement within the same backing allocation,
+    # so its size is the total, not a per-tensor share.
+    total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
+    return total_gpu_kv_bytes // kv_cache_config.num_blocks
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -93,12 +103,22 @@ def build_offloading_config(
         assert tokens_per_chunk_int % tokens_per_block == 0
         blocks_per_chunk = tokens_per_chunk_int // tokens_per_block
 
-    worker_kv_bytes_per_block = 0
-    if kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:
-        # Every KVCacheTensor describes placement within the same backing allocation,
-        # so its size is the total, not a per-tensor share.
-        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
-        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+    worker_kv_bytes_per_block = compute_worker_kv_bytes_per_block(kv_cache_config)
+    # With pipeline parallelism the PP stages hold different layer sets, so
+    # their local per-block byte counts differ. The shared-memory offload
+    # region is one file with one geometry shared by every process; size the
+    # per-worker slot by the global maximum (attached to KVCacheConfig by the
+    # engine) so all processes agree. Smaller stages just leave the slot tail
+    # unused (create_next_view fills slots front-to-back and asserts bounds).
+    global_max = getattr(kv_cache_config, "max_worker_kv_bytes_per_block", 0)
+    if global_max > worker_kv_bytes_per_block:
+        worker_kv_bytes_per_block = global_max
+    elif 0 < global_max < worker_kv_bytes_per_block:
+        raise ValueError(
+            f"max_worker_kv_bytes_per_block={global_max} is smaller than this "
+            f"worker's local value {worker_kv_bytes_per_block}; the engine-"
+            "computed maximum must cover every worker."
+        )
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec
