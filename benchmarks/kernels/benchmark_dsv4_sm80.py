@@ -235,9 +235,8 @@ def _decode_inputs(
     kernel roughly 2.6x against the live 17.30 us and is why bench-derived
     per-call numbers disagreed with the trace.
     """
-    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
-
     from vllm.platforms import current_platform
+    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
 
     is_fnuz = current_platform.is_fp8_fnuz()
     # The cache the gather indexes into is the pool when one is given, and the
@@ -1013,9 +1012,8 @@ def _c128_decode_inputs(
     blocked kernel derives from `indptr`. Both kernels then take *the same*
     ragged buffers, so the arm compares implementations and nothing else.
     """
-    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
-
     from vllm.platforms import current_platform
+    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         build_ragged_indices_from_dense,
     )
@@ -2629,11 +2627,10 @@ def _launch_gemv_split(
 
 
 def bench_dense_gemv(ms: list[int], block_ns: list[int], device: torch.device) -> None:
-    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
-
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
     )
+    from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
 
     kernel, dot_kernel, split_kernel, reduce_kernel = _import_gemv_triton()
     lut = get_e4m3fn_bf16_lut(device)
