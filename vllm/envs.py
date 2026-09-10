@@ -327,7 +327,6 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
-    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2383,9 +2382,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
     # Timeout for PLE weight loading and TP worker registration.
-    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
-        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
-    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
