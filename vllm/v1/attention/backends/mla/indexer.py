@@ -431,6 +431,18 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [256]
+
+
+class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    """DeepSeek-V4.1 indexer pages: 64 tokens on SM90 (FlashMLA), else 128."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V41_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64 if current_platform.is_device_capability_family(90) else 128]
 
 
