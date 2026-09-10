@@ -323,6 +323,18 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            # The checkpoint stores embed_tokens once, as a top-level (tied)
+            # weight with no spec layer index. Without PP the draft shares the
+            # target's embedding afterwards, but under pipeline parallelism the
+            # target's embed_tokens is a PPMissingLayer on the draft's (last)
+            # stage, so the draft must load its own copy here or it drafts
+            # from uninitialized weights (acceptance collapses to ~0).
+            if name == "model.embed_tokens.weight" and name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue

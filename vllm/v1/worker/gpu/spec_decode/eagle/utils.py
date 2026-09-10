@@ -4,9 +4,13 @@ import torch
 import torch.nn as nn
 
 from vllm.config import CompilationMode, VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+
+
+def _has_real_weight(module: nn.Module | None) -> bool:
+    """False for None and for PPMissingLayer, which carries no ``weight``."""
+    return module is not None and getattr(module, "weight", None) is not None
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -79,25 +83,28 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     target_inner = target_language_model.model
     draft_inner = eagle_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-            target_inner, "embedding", None
-        )
-        # If the target's embedding is LoRA-wrapped, share the underlying base
-        # layer. The draft is not part of the LoRA adapter; sharing the wrapper
-        # would make the draft run the LoRA embedding kernel with the target's
-        # punica metadata (sized for the target's token count), causing an
-        # out-of-bounds GPU access during multi-step draft decode.
-        if isinstance(target_embed, BaseLayerWithLoRA):
-            target_embed = target_embed.base_layer
-        draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
-            eagle_model, "has_own_embed_tokens", draft_embed, target_embed
-        ):
-            if draft_embed is not None:
-                del draft_inner.embed_tokens
-            draft_inner.embed_tokens = target_embed
+    # Share the target's embedding only when it is materialized on this rank.
+    # Under PP the drafter runs on the last stage, where the target's
+    # embed_tokens is normally a PPMissingLayer (no weight); aliasing that would
+    # silently turn the draft's embedding into a no-op, so the draft keeps and
+    # loads its own copy instead (see the MTP load_weights implementations).
+    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+        target_inner, "embedding", None
+    )
+    # If the target's embedding is LoRA-wrapped, share the underlying base
+    # layer. The draft is not part of the LoRA adapter; sharing the wrapper
+    # would make the draft run the LoRA embedding kernel with the target's
+    # punica metadata (sized for the target's token count), causing an
+    # out-of-bounds GPU access during multi-step draft decode.
+    if isinstance(target_embed, BaseLayerWithLoRA):
+        target_embed = target_embed.base_layer
+    draft_embed = getattr(draft_inner, "embed_tokens", None)
+    if _has_real_weight(target_embed) and _should_share(
+        eagle_model, "has_own_embed_tokens", draft_embed, target_embed
+    ):
+        if draft_embed is not None:
+            del draft_inner.embed_tokens
+        draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(eagle_model, "lm_head", None)
