@@ -65,7 +65,7 @@ services:
       - --host=127.0.0.1
       - --port=5556
       - --http-port=18556
-      - --chunk-size=800
+      - --chunk-size=1024 # must be a multiple of the model's KV block size, see each model's LMCache note below
       - --separate-object-groups
       - --l1-size-gb=1024
       - --eviction-policy=LRU
@@ -127,6 +127,7 @@ vllm serve wtdcode/GLM-5.3-Flash-AWQ-W4A16 \
 
 - Verified with MTP-3 on 4x A100-80GB (sm80). On 8x RTX A6000 (sm86) use `--tensor-parallel-size 8` and drop `--gpu-memory-utilization` to 0.85 — with the MTP draft loaded, 0.9+ OOMs during cudagraph warmup on 48 GB cards.
 - Serving directly from the Hugging Face repository ID works; no manual snapshot-path resolution is needed.
+- LMCache: the unified KV block size is 1152, so `--chunk-size` must be a multiple of 1152 (use `--chunk-size 1152 --separate-object-groups`), and add `--prefix-cache-retention-interval 1152 --max-num-batched-tokens 1152` to `vllm serve` (the LMCache fork requires a recurrent-state checkpoint at every chunk boundary and rejects MTP + align mode with a larger batch budget).
 
 #### Qwen3.8-Flash-Next (v0.9.0+)
 
@@ -156,6 +157,7 @@ vllm serve /path/to/your/qwen3.8 \
 
 - `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
+- LMCache: the unified KV block size is 800, so `--chunk-size` must be a multiple of 800 (use `--chunk-size 800 --separate-object-groups`), and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` to `vllm serve` (same MTP + align-mode rule as GLM-5.3-Flash).
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 
 #### DeepSeek V4 Flash
@@ -178,3 +180,4 @@ vllm serve /path/to/your/deepseek \
 - Keep `num_speculative_tokens` at 5 on Ampere. Values below 5 (the checkpoint's `dspark_block_size`) are rejected, and 7 needs ~200 KB of shared memory vs the 163 KB Ampere limit (`triton OutOfResources` error). 6 does start, but draft positions past the native block are almost never accepted (3–13% in our measurements), so it only wastes draft compute — output quality and speed are the same as 5.
 - Requests that set neither `thinking` nor `reasoning_effort` now get thinking mode with high effort, matching the official 0731 API mapping (`reasoning_effort: "none"` restores plain chat mode). Agentic/tool-calling clients should pass a `reasoning_effort` explicitly from the first turn of a session — sessions that run without the effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops.
 - `--hf-overrides '{"head_dtype": "float32"}'` once helped reduce garbage outputs by improving precisions but might be not compulsory.
+- LMCache: the KV block size is 256 (DeepSeek-V4-Flash and Vision-Exp) or 128 (DeepSeek-V4.1-Flash), so `--chunk-size 1024` works for all three; add `--prefix-cache-retention-interval 1024` to `vllm serve` (the LMCache fork requires a state checkpoint at every chunk boundary for the sliding-window groups).
