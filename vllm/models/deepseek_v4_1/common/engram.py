@@ -53,6 +53,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 
 logger = init_logger(__name__)
 
@@ -583,7 +584,8 @@ def _engram_lookup_kernel(
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA.
+    `weight`/`scales` may address pinned host memory through UVA. `weight` is
+    the uint8 view of the e4m3 rows so the decode also compiles below SM89.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -603,8 +605,9 @@ def _engram_lookup_kernel(
         values = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
-            other=0.0,
+            other=0,
         )
+        values = _decode_fp8_f32(values, False)
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -614,7 +617,7 @@ def _engram_lookup_kernel(
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         tl.store(
             out + rows[:, None] * DIM + cols[None, :],
-            (values.to(tl.float32) * scale).to(tl.bfloat16),
+            (values * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
 
@@ -729,7 +732,7 @@ class ParallelEngramEmbedding(nn.Module):
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight,
+            weight.view(torch.uint8),
             scales,
             indices,
             out,
