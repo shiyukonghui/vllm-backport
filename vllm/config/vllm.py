@@ -81,6 +81,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForConditionalGeneration",
         "DeepSeekV4MTPModel",
+        "DeepseekV41ForCausalLM",
         "Dots3NoteForCausalLM",
         "Dots3NoteMTPModel",
         "Glm5NextForCausalLM",
@@ -373,7 +374,8 @@ class VllmConfig:
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
     engram_config: EngramConfig | None = None
-    """Optional Engram configuration, only valid for supported PLE models."""
+    """Optional Engram configuration, only valid for models with supported
+    Engram (PLE / n-gram) embeddings."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -1135,7 +1137,8 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
         # Draft configs inherit the target's communication groups and settings.
-        # Qwen4Exp MTP itself disables PLE, so validate its target instead.
+        # Qwen4Exp MTP disables PLE and DeepSeek V4.1 MTP layers carry no
+        # engram of their own, so validate the target instead.
         if (
             speculative_config is not None
             and model_config is speculative_config.draft_model_config

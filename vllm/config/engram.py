@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Architecture -> the hf_text_config field naming the layers that own Engram
+# tables. A model is only configurable here if it actually has such layers.
+_ENGRAM_LAYER_FIELDS = {
+    "Qwen4ExpForCausalLM": "ple_layer_ids",
+    "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
+    "DeepseekV41ForCausalLM": "engram_layer_ids",
+}
+
 
 def _default_cpu_offload() -> bool:
     """Honor the legacy environment variable only when the field is omitted."""
@@ -33,30 +41,36 @@ class EngramConfig:
     cpu_offload: bool = Field(default_factory=_default_cpu_offload)
     """Store embedding weights in pinned CPU memory for UVA lookup.
     Defaults to False, or VLLM_PLE_CPU_OFFLOAD when set for compatibility.
-    An explicit value takes precedence over the legacy environment variable."""
+    An explicit value takes precedence over the legacy environment variable.
+    For DeepSeek V4.1 each rank offloads its assigned hash heads, so host
+    table storage and lookup traffic scale with the heads assigned to it."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
-    Otherwise, each DP rank has a separate TP-sharded embedding replica."""
+    Otherwise, each DP rank has a separate TP-sharded embedding replica.
+    Only honored by the Qwen4Exp PLE implementation."""
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without supported embeddings."""
         from vllm.platforms import current_platform
 
-        supported_architectures = {
-            "Qwen4ExpForCausalLM",
-            "Qwen4ExpForConditionalGeneration",
-        }
+        field = (
+            _ENGRAM_LAYER_FIELDS.get(model_config.architecture)
+            if model_config is not None
+            else None
+        )
         if (
             model_config is None
-            or model_config.architecture not in supported_architectures
+            or field is None
             or not current_platform.is_cuda()
-            or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
+            or not getattr(model_config.hf_text_config, field, None)
         ):
+            supported = ", ".join(sorted(_ENGRAM_LAYER_FIELDS))
+            layer_field = field or "ple_layer_ids / engram_layer_ids"
             raise ValueError(
                 "EngramConfig requires a model with supported Engram "
-                "embeddings. Currently only the CUDA Qwen4Exp implementation "
-                "with non-empty ple_layer_ids is supported."
+                f"embeddings. Currently only the CUDA implementations of "
+                f"{supported} with non-empty {layer_field} are supported."
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
