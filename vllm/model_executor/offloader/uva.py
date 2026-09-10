@@ -10,7 +10,11 @@ from torch.func import functional_call
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.offloader.base import BaseOffloader, pin_exact, should_pin_memory
+from vllm.model_executor.offloader.base import (
+    BaseOffloader,
+    pin_exact,
+    should_pin_memory,
+)
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor

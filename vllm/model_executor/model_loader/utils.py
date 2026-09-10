@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.reload import (
 )
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
 from vllm.model_executor.models.interfaces import SupportsQuant
+from vllm.model_executor.offloader.base import pin_exact, release_pinned
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import release_device_memory_under_pressure
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -159,7 +160,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     original_device_states: dict[str, torch.device] = {}
-    uva_offloaded_parameters: list[str] = []
+    # name -> data_ptr of the pinned host mapping backing the UVA view, so a
+    # re-offload after post-processing can release the first mapping.
+    uva_offloaded_parameters: dict[str, int] = {}
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
@@ -167,7 +170,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+            uva_offloaded_parameters[name] = p.data.data_ptr()
         # Parameters already on target device are not touched
 
     try:
@@ -190,22 +193,13 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                 p, "_vllm_is_uva_offloaded", False
             ):
                 # The parameter is being re-offloaded after post-processing
-                # replaced it (Marlin repack).  Release the mapping the FIRST
-                # offload created, or both copies stay resident.
-                _stale_ptr = p.data.data_ptr()
+                # replaced it (e.g. a Marlin repack). Pin at exact size again
+                # (see offloader.base.pin_exact) and release the mapping the
+                # first offload created, or both copies stay resident.
                 cpu_data = p.data.to(device="cpu")
                 if use_pin_memory:
-                    # Exact-size pinning (see offloader.base.pin_exact). This is
-                    # the RE-offload after process_weights_after_loading swapped
-                    # the offloaded tensor for a new device tensor (e.g. a Marlin
-                    # repack), so without this the power-of-two rounding is paid
-                    # a SECOND time, on top of the initial offload.
-                    from vllm.model_executor.offloader.base import pin_exact
-
                     cpu_data = pin_exact(cpu_data)
-                    from vllm.model_executor.offloader.base import release_pinned
-
-                    release_pinned(_stale_ptr)
+                    release_pinned(uva_offloaded_parameters[name])
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
 
