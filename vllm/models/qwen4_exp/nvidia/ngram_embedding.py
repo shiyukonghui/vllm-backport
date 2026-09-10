@@ -19,6 +19,12 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -183,6 +189,24 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             quant_config, ModelOptQuantConfigBase
         ) and quant_config.is_layer_excluded(prefix):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if isinstance(quant_config, CompressedTensorsConfig):
+            # compressed-tensors exports (e.g. the AWQ W4A16 checkpoints) only
+            # quantize Linear targets and list the PLE table under `ignore`,
+            # so its shards stay in the checkpoint dtype.
+            if should_ignore_layer(
+                prefix,
+                ignore=quant_config.ignore,
+                fused_mapping=quant_config.packed_modules_mapping,
+            ) or should_ignore_layer(
+                f"{prefix}.shard_0",
+                ignore=quant_config.ignore,
+                fused_mapping=quant_config.packed_modules_mapping,
+            ):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            raise NotImplementedError(
+                "Qwen4Exp PLE embedding requires compressed-tensors checkpoints "
+                f"to leave {prefix} unquantized (add it to `ignore`)."
+            )
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
