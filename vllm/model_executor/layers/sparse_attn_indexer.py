@@ -1102,11 +1102,13 @@ class SparseAttnIndexer(CustomOp):
             elif not use_fp4_cache:
                 device = topk_indices_buffer.device
                 warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
-                # 64/256 are the V3.2 and V4 indexer kernel block sizes; the
-                # configured cache block size covers user-chosen values, which
-                # the backends accept as any MultipleOf(64).
+                # 64/256 are the V3.2 and V4 indexer kernel block sizes, 128
+                # the V4.1 indexer cache block off SM90; the configured cache
+                # block size covers user-chosen values, which the backends
+                # accept as any MultipleOf(64).
                 block_sizes = {
                     64,
+                    128,
                     256,
                     get_current_vllm_config().cache_config.block_size,
                 }

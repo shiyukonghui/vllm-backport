@@ -1119,6 +1119,7 @@ class DeepseekV4Indexer(nn.Module):
             candidate_blocks=candidate_block_buffer,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            num_heads=self.n_head,
         )
 
     def _produce_k(
