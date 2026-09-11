@@ -546,27 +546,26 @@ def test_paged_q_lut_hoist_is_bit_identical(monkeypatch):
     B, next_n, H, D = 3, 6, 64, 128
     block_size, num_blocks = 64, 32
 
-    q_bytes = torch.randint(
-        0, 256, (B, next_n, H, D), dtype=torch.uint8, device=device
-    )
-    q_bytes[0, 0, 0, :2] = torch.tensor([0x7F, 0xFF], dtype=torch.uint8,
-                                        device=device)
+    q_bytes = torch.randint(0, 256, (B, next_n, H, D), dtype=torch.uint8, device=device)
+    q_bytes[0, 0, 0, :2] = torch.tensor([0x7F, 0xFF], dtype=torch.uint8, device=device)
     q = q_bytes.view(torch.float8_e4m3fn)
     kv_cache = _pack_paged_kv(
         torch.randn(num_blocks, block_size, D, dtype=torch.bfloat16, device=device)
     )
     weights = torch.randn(B * next_n, H, dtype=torch.float32, device=device)
-    context_lens = torch.full((B,), num_blocks * block_size // 2,
-                              dtype=torch.int32, device=device)
-    block_tables = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
-    ).view(1, -1).repeat(B, 1).contiguous()
+    context_lens = torch.full(
+        (B,), num_blocks * block_size // 2, dtype=torch.int32, device=device
+    )
+    block_tables = (
+        torch.arange(num_blocks, dtype=torch.int32, device=device)
+        .view(1, -1)
+        .repeat(B, 1)
+        .contiguous()
+    )
 
     outs = {}
     for hoisted in (False, True):
-        monkeypatch.setattr(
-            mqa_logits_mod.envs, "VLLM_INDEXER_PAGED_Q_BF16", hoisted
-        )
+        monkeypatch.setattr(mqa_logits_mod.envs, "VLLM_INDEXER_PAGED_Q_BF16", hoisted)
         outs[hoisted] = fp8_paged_mqa_logits_triton(
             q,
             kv_cache,
@@ -577,6 +576,8 @@ def test_paged_q_lut_hoist_is_bit_identical(monkeypatch):
         ).clone()
 
     assert torch.equal(outs[False], outs[True])
+
+
 @torch.inference_mode()
 def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
     """The torch fallback's next_n>1 branch must read the planar block layout.
@@ -599,9 +600,7 @@ def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
     context_lens = torch.tensor([13, 7], dtype=torch.int32, device=device)
     max_model_len = 16
     # Non-monotonic block tables: logical order != physical order.
-    block_tables = torch.tensor(
-        [[3, 0], [5, 1]], dtype=torch.int32, device=device
-    )
+    block_tables = torch.tensor([[3, 0], [5, 1]], dtype=torch.int32, device=device)
 
     kv_bf16 = torch.randn(
         num_blocks, block_size, dim, dtype=torch.bfloat16, device=device
@@ -613,12 +612,8 @@ def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
     k_fp8 = (kv_bf16.float() / sf).to(torch.float8_e4m3fn)
     kv_deq = (k_fp8.float() * sf).view(num_blocks, block_size, 1, dim)
 
-    q = torch.randn(
-        batch_size, next_n, heads, dim, dtype=torch.bfloat16, device=device
-    )
-    weights = torch.rand(
-        batch_size * next_n, heads, dtype=torch.float32, device=device
-    )
+    q = torch.randn(batch_size, next_n, heads, dim, dtype=torch.bfloat16, device=device)
+    weights = torch.rand(batch_size * next_n, heads, dtype=torch.float32, device=device)
 
     out = fp8_paged_mqa_logits_torch(
         q, packed, weights, context_lens, block_tables, max_model_len
@@ -634,9 +629,7 @@ def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
     )
     for i in range(batch_size):
         context_len_i = int(context_lens[i].item())
-        q_offsets = torch.arange(
-            context_len_i - next_n, context_len_i, device=device
-        )
+        q_offsets = torch.arange(context_len_i - next_n, context_len_i, device=device)
         context_limit = torch.full(
             (next_n,), context_len_i, dtype=torch.int32, device=device
         )
@@ -664,8 +657,6 @@ def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
             expected[
                 i * next_n : (i + 1) * next_n,
                 block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(
-                k_offsets[None, :] <= q_offsets[:, None], s, float("-inf")
-            )
+            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
 
     assert torch.equal(out, expected)

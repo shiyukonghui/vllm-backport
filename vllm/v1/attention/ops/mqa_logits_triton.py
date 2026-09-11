@@ -3,7 +3,6 @@
 """Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
 
 import functools
-
 import os
 
 import torch
@@ -111,7 +110,6 @@ _PREFILL_WARMUP_N = 8192
 _INDEXER_LUT_NAN_VALUE = 480.0
 
 
-
 @functools.lru_cache
 def _paged_q_bf16_default(device: torch.device) -> bool:
     """Whether to pre-decode q to bf16 on the host for the paged kernel.
@@ -128,6 +126,7 @@ def _paged_q_bf16_default(device: torch.device) -> bool:
         torch.cuda.get_device_properties(device).shared_memory_per_block_optin
         >= 160 * 1024
     )
+
 
 def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
     return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
@@ -320,9 +319,9 @@ def fp8_paged_mqa_logits_triton(
         # of once per (query, KV block). `lut[byte]` produces exactly what
         # `_decode_e4m3fn_bf16_lut` produces -- NaN pin at +-480 included --
         # so the operands reaching tl.dot are bit-identical.
-        q_in = fp8_lut.index_select(
-            0, q_byte.reshape(-1).to(torch.int32)
-        ).view(q_byte.shape)
+        q_in = fp8_lut.index_select(0, q_byte.reshape(-1).to(torch.int32)).view(
+            q_byte.shape
+        )
     else:
         q_in = q_byte
     # The block table is allocated at full max_model_len width and only

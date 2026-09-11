@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
@@ -318,6 +319,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """
 
     can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
     lse_base_on_e: bool = False
 
     def __init__(
@@ -389,12 +391,20 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
+            ql_nope, q_pe = q
+            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+                q = ql_nope
+            else:
+                q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        _, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
 
         if self.dcp_world_size > 1:
             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
@@ -405,6 +415,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 dcp_rank=self.dcp_rank,
                 cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
                 BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
@@ -414,6 +425,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
