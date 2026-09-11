@@ -160,7 +160,7 @@ vllm serve /path/to/your/qwen3.8 \
 - LMCache: the unified KV block size is 800, so `--chunk-size` must be a multiple of 800 (use `--chunk-size 800 --separate-object-groups`), and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` to `vllm serve` (same MTP + align-mode rule as GLM-5.3-Flash).
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 
-#### DeepSeek V4 Flash
+#### DeepSeek V4 Flash (Preview, 0731, Vision-Exp)
 
 ```bash
 vllm serve /path/to/your/deepseek \
@@ -180,4 +180,26 @@ vllm serve /path/to/your/deepseek \
 - Keep `num_speculative_tokens` at 5 on Ampere. Values below 5 (the checkpoint's `dspark_block_size`) are rejected, and 7 needs ~200 KB of shared memory vs the 163 KB Ampere limit (`triton OutOfResources` error). 6 does start, but draft positions past the native block are almost never accepted (3–13% in our measurements), so it only wastes draft compute — output quality and speed are the same as 5.
 - Requests that set neither `thinking` nor `reasoning_effort` now get thinking mode with high effort, matching the official 0731 API mapping (`reasoning_effort: "none"` restores plain chat mode). Agentic/tool-calling clients should pass a `reasoning_effort` explicitly from the first turn of a session — sessions that run without the effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops.
 - `--hf-overrides '{"head_dtype": "float32"}'` once helped reduce garbage outputs by improving precisions but might be not compulsory.
-- LMCache: the KV block size is 256 (DeepSeek-V4-Flash and Vision-Exp) or 128 (DeepSeek-V4.1-Flash), so `--chunk-size 1024` works for all three; add `--prefix-cache-retention-interval 1024` to `vllm serve` (the LMCache fork requires a state checkpoint at every chunk boundary for the sliding-window groups).
+- LMCache: the KV block size is 256 (DeepSeek-V4-Flash and Vision-Exp), so `--chunk-size 1024` works for all three; add `--prefix-cache-retention-interval 1024` to `vllm serve` (the LMCache fork requires a state checkpoint at every chunk boundary for the sliding-window groups).
+
+#### DeepSeek V4.1 Flash
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 --port 18005 \
+  --served-model-name deepseek-v4.1-flash \
+  --tensor-parallel-size 8 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.90 \
+  --kv-cache-dtype fp8_ds_mla \
+  --engram-config '{"cpu_offload": true}' \
+  --enable-prefix-caching \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,12,24,48,96,192,384],"max_cudagraph_capture_size":384}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true}' \
+  --tokenizer-mode deepseek_v41 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41
+```
+
+- Expert parallel also works.
+- LMCache: Note that the KV block size is 128.
