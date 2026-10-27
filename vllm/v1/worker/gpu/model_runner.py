@@ -997,6 +997,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
 
+            # Warmup activations stay cached on the capture streams, which
+            # nothing allocates from after capture; release them.
+            torch.accelerator.empty_cache()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
