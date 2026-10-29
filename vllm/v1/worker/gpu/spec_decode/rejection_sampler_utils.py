@@ -190,6 +190,17 @@ def _compute_global_logprobs_and_logsumexp(
 
 
 @triton.jit
+def _is_bonus_logit(expanded_local_pos_ptr, logit_idx, num_logits):
+    next_local_pos = tl.load(
+        expanded_local_pos_ptr + logit_idx + 1,
+        mask=logit_idx + 1 < num_logits,
+        other=0,
+    )
+    return next_local_pos == 0
+
+
+# num_logits only bounds the bonus-logit lookahead; one kernel serves every value.
+@triton.jit(do_not_specialize=["num_logits"])
 def _compute_local_logits_stats_kernel(
     # [num_logits, num_blocks]
     target_local_argmax_ptr,
@@ -388,7 +399,7 @@ def _compute_cumulative_log_p_kernel(
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_logits"])
 def _compute_local_residual_mass_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,
