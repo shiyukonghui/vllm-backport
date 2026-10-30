@@ -15,7 +15,9 @@ import functools
 from unittest.mock import MagicMock, patch
 
 import pytest
-from transformers import Glm5NextConfig, PretrainedConfig
+from transformers import PretrainedConfig
+
+from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
