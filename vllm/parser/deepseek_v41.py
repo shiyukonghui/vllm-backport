@@ -32,7 +32,6 @@ from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
     _dsml_arg_value_extender,
-    _param_patterns,
     deepseek_v4_config,
 )
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
@@ -83,14 +82,14 @@ _PARAM_OPEN = r"<｜DSML｜ ?parameter"
 _PARAM_SHUT = r"</｜DSML｜ ?parameter>"
 
 _PARAM_RE = re.compile(
-    rf'{_PARAM_OPEN}\s+name="([^"]+)"\s+string="(true|false)">'
+    rf'{_PARAM_OPEN}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
     r"(.*?)"
     rf"(?:{_PARAM_SHUT}|(?={_PARAM_OPEN}\s+name=))",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
-    rf'{_PARAM_OPEN}\s+name="([^"]+)"\s+string="(true|false)">'
-    r"(.*)$",
+    rf'{_PARAM_OPEN}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+    r"(.*)\Z",
     re.DOTALL,
 )
 
